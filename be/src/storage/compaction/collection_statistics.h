@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,6 +41,8 @@ struct IOContext;
 
 struct RowSetSplits;
 
+class DeleteBitmap;
+
 class Rowset;
 using RowsetSharedPtr = std::shared_ptr<Rowset>;
 
@@ -47,14 +50,33 @@ class TabletIndex;
 class TabletSchema;
 using TabletSchemaSPtr = std::shared_ptr<TabletSchema>;
 
+namespace segment_v2 {
+class TermIterator;
+} // namespace segment_v2
+
+// The rows of a merge-on-write tablet that its segments still hold but a scan at `version` does
+// not return: rows a later load overwrote or deleted, which the delete bitmap marks, and rows
+// written with the delete sign, which every query filters out. Compaction removes both, on each
+// replica at its own time, so statistics counting them would differ between the replicas of a
+// tablet, and so would every BM25 score.
+struct MowHiddenRows {
+    std::shared_ptr<DeleteBitmap> delete_bitmap;
+    int64_t version = -1;
+};
+
 class CollectionStatistics {
 public:
     CollectionStatistics() = default;
     virtual ~CollectionStatistics() = default;
 
+    // With `hidden_rows`, the statistics describe only the rows a merge-on-write scan returns,
+    // so every replica of a tablet scores alike whatever it has compacted: the hidden rows are
+    // left out of the document count and the term document frequencies, and the token count is
+    // the sum of the document lengths the norms of the returned rows stand for.
     Status collect(RuntimeState* state, const std::vector<RowSetSplits>& rs_splits,
                    const TabletSchemaSPtr& tablet_schema,
-                   const VExprContextSPtrs& common_expr_ctxs_push_down, io::IOContext* io_ctx);
+                   const VExprContextSPtrs& common_expr_ctxs_push_down, io::IOContext* io_ctx,
+                   const MowHiddenRows* hidden_rows = nullptr);
 
     MOCK_FUNCTION float get_or_calculate_idf(const std::wstring& lucene_col_name,
                                              const std::wstring& term);
@@ -71,7 +93,7 @@ private:
                                 CollectInfoMap* collect_infos);
     Status process_segment(const RowsetSharedPtr& rowset, int32_t seg_id,
                            const TabletSchema* tablet_schema, const CollectInfoMap& collect_infos,
-                           io::IOContext* io_ctx);
+                           const MowHiddenRows* hidden_rows, io::IOContext* io_ctx);
 
     uint64_t get_term_doc_freq_by_col(const std::wstring& lucene_col_name,
                                       const std::wstring& term);
@@ -79,6 +101,9 @@ private:
     uint64_t get_doc_num() const;
 
     uint64_t _total_num_docs = 0;
+    // Whether a collected segment held rows the scan does not return, so that no documents can
+    // mean every row is hidden.
+    bool _counted_hidden_docs = false;
     std::unordered_map<std::wstring, uint64_t> _total_num_tokens;
     std::unordered_map<std::wstring, std::unordered_map<std::wstring, uint64_t>> _term_doc_freqs;
 
@@ -108,7 +133,7 @@ public:
     // Later callers wait for the first collection and receive its result or error.
     Status copy_to(RuntimeState* state, const TabletSchemaSPtr& tablet_schema,
                    const VExprContextSPtrs& common_expr_ctxs_push_down, io::IOContext* io_ctx,
-                   CollectionStatistics* statistics);
+                   const MowHiddenRows* hidden_rows, CollectionStatistics* statistics);
 
 private:
     std::mutex _mutex;
@@ -118,6 +143,30 @@ private:
     CollectionStatistics _statistics;
 };
 using TabletCollectionStatisticsPtr = std::shared_ptr<TabletCollectionStatistics>;
+
+// Implementation details of the visible-row statistics, surfaced for collection_statistics_test.
+namespace collection_statistics_detail {
+
+// How many of the ascending `docs` the term's postings list, leaping over the postings between
+// them, so the cost follows the smaller of the two.
+uint64_t count_listed_docs(const segment_v2::TermIterator& postings,
+                           std::span<const uint32_t> docs);
+
+// How many documents the term's postings list among those set in `doc_bits`, a bitset over the
+// segment's documents, decoding every posting once.
+uint64_t count_listed_docs(const segment_v2::TermIterator& postings,
+                           const std::vector<uint64_t>& doc_bits);
+
+// A bitset over `doc_count` documents with the `docs` set.
+std::vector<uint64_t> doc_bitset(std::span<const uint32_t> docs, uint32_t doc_count);
+
+// The sum of the document lengths that the encoded norms of the ascending `docs` stand for.
+uint64_t sum_norm_lengths(const uint8_t* norms, std::span<const uint32_t> docs);
+
+// The sum of the document lengths that the first `doc_count` encoded norms stand for.
+uint64_t sum_norm_lengths(const uint8_t* norms, uint32_t doc_count);
+
+} // namespace collection_statistics_detail
 
 #include "common/compile_check_end.h"
 } // namespace doris

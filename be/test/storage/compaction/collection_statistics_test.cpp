@@ -21,6 +21,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <memory>
 #include <string>
 
@@ -46,6 +47,7 @@
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_meta.h"
 #include "storage/rowset/rowset_reader.h"
+#include "storage/tablet/tablet_meta.h"
 #include "storage/tablet/tablet_schema.h"
 #include "testutil/mock/mock_runtime_state.h"
 #include "util/defer_op.h"
@@ -709,14 +711,252 @@ TEST_F(CollectionStatisticsTest, TabletCollectionStatisticsCollectsOnceAndCopies
 
     CollectionStatistics first;
     CollectionStatistics second;
-    EXPECT_TRUE(
-            tablet_statistics
-                    .copy_to(runtime_state_.get(), tablet_schema, expr_contexts, nullptr, &first)
-                    .ok());
-    EXPECT_TRUE(
-            tablet_statistics
-                    .copy_to(runtime_state_.get(), tablet_schema, expr_contexts, nullptr, &second)
-                    .ok());
+    EXPECT_TRUE(tablet_statistics
+                        .copy_to(runtime_state_.get(), tablet_schema, expr_contexts, nullptr,
+                                 nullptr, &first)
+                        .ok());
+    EXPECT_TRUE(tablet_statistics
+                        .copy_to(runtime_state_.get(), tablet_schema, expr_contexts, nullptr,
+                                 nullptr, &second)
+                        .ok());
+}
+
+namespace {
+
+TabletSchemaSPtr create_english_index_schema() {
+    TabletSchemaPB schema_pb;
+    schema_pb.set_keys_type(DUP_KEYS);
+    schema_pb.set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V3);
+    auto tablet_schema = std::make_shared<TabletSchema>();
+    tablet_schema->init_from_pb(schema_pb);
+
+    TabletColumn column;
+    column.set_unique_id(1);
+    column.set_name("content");
+    column.set_type(FieldType::OLAP_FIELD_TYPE_STRING);
+    tablet_schema->append_column(column);
+
+    TabletIndex index;
+    index._index_id = 1;
+    index._index_type = IndexType::INVERTED;
+    index._col_unique_ids.push_back(1);
+    index._properties["parser"] = "english";
+    index._properties["support_phrase"] = "true";
+    tablet_schema->append_index(std::move(index));
+    return tablet_schema;
+}
+
+// Writes the inverted index of a segment holding `rows`, one document each.
+Status write_index_segment(const TabletSchemaSPtr& tablet_schema, const std::string& test_dir,
+                           const std::string& segment_path, const std::vector<std::string>& rows) {
+    std::vector<StorePath> paths;
+    paths.emplace_back(test_dir, 1024);
+    auto tmp_file_dirs = std::make_unique<segment_v2::TmpFileDirs>(paths);
+    RETURN_IF_ERROR(tmp_file_dirs->init());
+    ExecEnv::GetInstance()->set_tmp_file_dir(std::move(tmp_file_dirs));
+
+    const std::string prefix {
+            segment_v2::InvertedIndexDescriptor::get_index_file_path_prefix(segment_path)};
+    io::FileWriterPtr compound_file;
+    io::FileWriterOptions options;
+    auto fs = io::global_local_filesystem();
+    RETURN_IF_ERROR(
+            fs->create_file(segment_v2::InvertedIndexDescriptor::get_index_file_path_v2(prefix),
+                            &compound_file, &options));
+    segment_v2::IndexFileWriter file_writer(fs, prefix, "hidden_rows", 0,
+                                            InvertedIndexStorageFormatPB::V3,
+                                            std::move(compound_file));
+    const auto indexes = tablet_schema->inverted_indexs(1);
+    DORIS_CHECK(indexes.size() == 1);
+    std::unique_ptr<segment_v2::IndexColumnWriter> column_writer;
+    RETURN_IF_ERROR(segment_v2::IndexColumnWriter::create(&tablet_schema->column(0), &column_writer,
+                                                          &file_writer, indexes[0]));
+    std::vector<Slice> values(rows.begin(), rows.end());
+    RETURN_IF_ERROR(column_writer->add_values("content", values.data(), values.size()));
+    RETURN_IF_ERROR(column_writer->finish());
+    RETURN_IF_ERROR(file_writer.begin_close());
+    return file_writer.finish_close();
+}
+
+} // namespace
+
+// A replica whose segment still holds a row that a later load overwrote must collect the same
+// statistics as a replica that compacted the row away, or the two score every row differently.
+TEST_F(CollectionStatisticsTest, HiddenRowsAreCollectedLikeCompactedAway) {
+    IndexPolicyMgr policy_mgr;
+    auto* exec_env = ExecEnv::GetInstance();
+    auto* original_policy_mgr = exec_env->index_policy_mgr();
+    exec_env->_index_policy_mgr = &policy_mgr;
+    Defer restore_policy_mgr([&] { exec_env->_index_policy_mgr = original_policy_mgr; });
+
+    auto tablet_schema = create_english_index_schema();
+    // Thirty-one tokens: CLucene's norm holds this length only approximately.
+    std::string overwritten;
+    for (int i = 0; i < 30; ++i) {
+        overwritten += "gamma ";
+    }
+    overwritten += "alpha";
+    const std::string uncompacted_path = test_dir_ + "/hidden_rows_uncompacted_0.dat";
+    const std::string compacted_path = test_dir_ + "/hidden_rows_compacted_0.dat";
+    ASSERT_TRUE(write_index_segment(tablet_schema, test_dir_, uncompacted_path,
+                                    {"alpha beta", overwritten, "beta gamma delta"})
+                        .ok());
+    ASSERT_TRUE(write_index_segment(tablet_schema, test_dir_, compacted_path,
+                                    {"alpha beta", "beta gamma delta"})
+                        .ok());
+
+    struct Collected {
+        uint64_t doc_count;
+        uint64_t token_count;
+        uint64_t alpha_doc_frequency;
+        uint64_t gamma_doc_frequency;
+        float avg_dl;
+        float alpha_idf;
+    };
+    // The delete bitmap's aggregation cache is keyed by tablet and rowset, and the mock rowsets
+    // share their ids, so each collection uses its own tablet id.
+    int64_t next_tablet_id = 9100;
+    auto collect = [&](const std::string& segment_path, const std::vector<uint32_t>& hidden_rows,
+                       bool with_hidden_rows) -> Collected {
+        auto rowset_meta = std::make_shared<collection_statistics::MockRowsetMeta>();
+        auto rowset =
+                std::make_shared<collection_statistics::MockRowset>(tablet_schema, rowset_meta);
+        rowset->set_num_segments(1);
+        rowset->set_segment_path(0, segment_path);
+        auto reader = std::make_shared<collection_statistics::MockRowsetReader>(rowset);
+        std::vector<RowSetSplits> splits {RowSetSplits(reader)};
+
+        constexpr int64_t kVersion = 5;
+        MowHiddenRows hidden {.delete_bitmap = std::make_shared<DeleteBitmap>(next_tablet_id++),
+                              .version = kVersion};
+        for (const uint32_t row : hidden_rows) {
+            hidden.delete_bitmap->add({rowset->rowset_id(), 0, kVersion}, row);
+        }
+        CollectionStatistics stats;
+        const Status status = stats.collect(runtime_state_.get(), splits, tablet_schema,
+                                            create_match_expr_contexts("alpha gamma"), nullptr,
+                                            with_hidden_rows ? &hidden : nullptr);
+        EXPECT_TRUE(status.ok()) << status;
+        return {.doc_count = stats.get_doc_num(),
+                .token_count = stats.get_total_term_cnt_by_col(L"1"),
+                .alpha_doc_frequency = stats.get_term_doc_freq_by_col(L"1", L"alpha"),
+                .gamma_doc_frequency = stats.get_term_doc_freq_by_col(L"1", L"gamma"),
+                .avg_dl = stats.get_or_calculate_avg_dl(L"1"),
+                .alpha_idf = stats.get_or_calculate_idf(L"1", L"alpha")};
+    };
+
+    const Collected uncompacted = collect(uncompacted_path, {1}, true);
+    const Collected compacted = collect(compacted_path, {}, true);
+    EXPECT_EQ(uncompacted.doc_count, 2);
+    EXPECT_EQ(uncompacted.token_count, 5);
+    EXPECT_EQ(uncompacted.alpha_doc_frequency, 1);
+    EXPECT_EQ(uncompacted.gamma_doc_frequency, 1);
+    EXPECT_EQ(uncompacted.doc_count, compacted.doc_count);
+    EXPECT_EQ(uncompacted.token_count, compacted.token_count);
+    EXPECT_EQ(uncompacted.alpha_doc_frequency, compacted.alpha_doc_frequency);
+    EXPECT_EQ(uncompacted.gamma_doc_frequency, compacted.gamma_doc_frequency);
+    EXPECT_EQ(uncompacted.avg_dl, compacted.avg_dl);
+    EXPECT_EQ(uncompacted.alpha_idf, compacted.alpha_idf);
+
+    // Without the delete bitmap the overwritten row is counted, with its exact length.
+    const Collected all_rows = collect(uncompacted_path, {}, false);
+    EXPECT_EQ(all_rows.doc_count, 3);
+    EXPECT_EQ(all_rows.token_count, 36);
+    EXPECT_EQ(all_rows.alpha_doc_frequency, 2);
+}
+
+// A tablet whose rows were all deleted or overwritten still has segments to collect from, but no
+// document a query can match. Its statistics are empty, not missing.
+TEST_F(CollectionStatisticsTest, AllRowsHiddenCollectsEmptyStatistics) {
+    IndexPolicyMgr policy_mgr;
+    auto* exec_env = ExecEnv::GetInstance();
+    auto* original_policy_mgr = exec_env->index_policy_mgr();
+    exec_env->_index_policy_mgr = &policy_mgr;
+    Defer restore_policy_mgr([&] { exec_env->_index_policy_mgr = original_policy_mgr; });
+
+    auto tablet_schema = create_english_index_schema();
+    const std::string segment_path = test_dir_ + "/all_rows_hidden_0.dat";
+    ASSERT_TRUE(write_index_segment(tablet_schema, test_dir_, segment_path, {"alpha beta", "alpha"})
+                        .ok());
+
+    auto rowset_meta = std::make_shared<collection_statistics::MockRowsetMeta>();
+    auto rowset = std::make_shared<collection_statistics::MockRowset>(tablet_schema, rowset_meta);
+    rowset->set_num_segments(1);
+    rowset->set_segment_path(0, segment_path);
+    auto reader = std::make_shared<collection_statistics::MockRowsetReader>(rowset);
+    std::vector<RowSetSplits> splits {RowSetSplits(reader)};
+
+    constexpr int64_t kVersion = 3;
+    MowHiddenRows hidden {.delete_bitmap = std::make_shared<DeleteBitmap>(9200),
+                          .version = kVersion};
+    hidden.delete_bitmap->add({rowset->rowset_id(), 0, kVersion}, 0);
+    hidden.delete_bitmap->add({rowset->rowset_id(), 0, kVersion}, 1);
+    CollectionStatistics stats;
+    const Status status = stats.collect(runtime_state_.get(), splits, tablet_schema,
+                                        create_match_expr_contexts("alpha"), nullptr, &hidden);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(stats.get_doc_num(), 0);
+    EXPECT_EQ(stats.get_term_doc_freq_by_col(L"1", L"alpha"), 0);
+    EXPECT_TRUE(std::isfinite(stats.get_or_calculate_avg_dl(L"1")));
+    EXPECT_TRUE(std::isfinite(stats.get_or_calculate_idf(L"1", L"alpha")));
+
+    // Without any collected segment the statistics are still reported missing.
+    CollectionStatistics nothing_collected;
+    EXPECT_THROW(nothing_collected.get_doc_num(), Exception);
+}
+
+TEST_F(CollectionStatisticsTest, CountListedDocsLeapsOrScansOverHiddenRows) {
+    IndexPolicyMgr policy_mgr;
+    auto* exec_env = ExecEnv::GetInstance();
+    auto* original_policy_mgr = exec_env->index_policy_mgr();
+    exec_env->_index_policy_mgr = &policy_mgr;
+    Defer restore_policy_mgr([&] { exec_env->_index_policy_mgr = original_policy_mgr; });
+
+    auto tablet_schema = create_english_index_schema();
+    std::vector<std::string> rows;
+    for (int i = 0; i < 300; ++i) {
+        rows.emplace_back(i % 3 == 0 ? "alpha beta" : "beta");
+    }
+    const std::string segment_path = test_dir_ + "/count_listed_0.dat";
+    ASSERT_TRUE(write_index_segment(tablet_schema, test_dir_, segment_path, rows).ok());
+
+    const std::string prefix {
+            segment_v2::InvertedIndexDescriptor::get_index_file_path_prefix(segment_path)};
+    segment_v2::IndexFileReader file_reader(io::global_local_filesystem(), prefix,
+                                            InvertedIndexStorageFormatPB::V3);
+    ASSERT_TRUE(file_reader.init().ok());
+    auto compound = file_reader.open(tablet_schema->inverted_indexs(1)[0]);
+    ASSERT_TRUE(compound.has_value()) << compound.error();
+    auto* raw_reader = lucene::index::IndexReader::open(compound->get());
+    auto searcher = std::make_unique<lucene::search::IndexSearcher>(raw_reader, true);
+    auto* reader = searcher->getReader();
+
+    const std::vector<uint32_t> hidden {0, 1, 2, 3, 150, 151, 297, 299};
+    auto alpha = segment_v2::TermIterator::create(nullptr, false, reader, L"1", "alpha");
+    // 0, 3, 150 and 297 hold alpha.
+    EXPECT_EQ(collection_statistics_detail::count_listed_docs(*alpha, hidden), 4);
+    auto beta = segment_v2::TermIterator::create(nullptr, false, reader, L"1", "beta");
+    EXPECT_EQ(collection_statistics_detail::count_listed_docs(*beta, hidden), hidden.size());
+    auto omega = segment_v2::TermIterator::create(nullptr, false, reader, L"1", "omega");
+    EXPECT_EQ(collection_statistics_detail::count_listed_docs(*omega, hidden), 0);
+    auto none = segment_v2::TermIterator::create(nullptr, false, reader, L"1", "alpha");
+    EXPECT_EQ(collection_statistics_detail::count_listed_docs(*none, std::span<const uint32_t> {}),
+              0);
+
+    // Scanning the postings against a bitset of the hidden rows counts the same.
+    const auto hidden_bits = collection_statistics_detail::doc_bitset(hidden, 300);
+    auto alpha_scan = segment_v2::TermIterator::create(nullptr, false, reader, L"1", "alpha");
+    EXPECT_EQ(collection_statistics_detail::count_listed_docs(*alpha_scan, hidden_bits), 4);
+    auto beta_scan = segment_v2::TermIterator::create(nullptr, false, reader, L"1", "beta");
+    EXPECT_EQ(collection_statistics_detail::count_listed_docs(*beta_scan, hidden_bits),
+              hidden.size());
+    auto omega_scan = segment_v2::TermIterator::create(nullptr, false, reader, L"1", "omega");
+    EXPECT_EQ(collection_statistics_detail::count_listed_docs(*omega_scan, hidden_bits), 0);
+
+    const uint8_t* norms = reader->norms(L"1");
+    ASSERT_NE(norms, nullptr);
+    EXPECT_EQ(collection_statistics_detail::sum_norm_lengths(norms, 300), 400);
+    EXPECT_EQ(collection_statistics_detail::sum_norm_lengths(norms, hidden), 12);
 }
 
 TEST_F(CollectionStatisticsTest, CollectWithCastWrappedSlotRef) {
